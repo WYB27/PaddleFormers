@@ -32,31 +32,13 @@ from paddleformers.trainer import (
     get_last_checkpoint,
     set_seed,
 )
-from paddleformers.transformers import (
+from paddleformers.transformers import (  # DeepseekV2ForCausalLM,; DeepseekV2ForCausalLMPipe,; DeepseekV3ForCausalLM,; DeepseekV3ForCausalLMPipe,; Ernie4_5_MoeForCausalLM,; Ernie4_5_MoeForCausalLMPipe,; Ernie4_5ForCausalLM,; Ernie4_5ForCausalLMPipe,; Qwen2ForCausalLM,; Qwen2ForCausalLMPipe,; Qwen2MoeForCausalLM,; Qwen2MoeForCausalLMPipe,; Qwen3ForCausalLM,; Qwen3ForCausalLMPipe,; Qwen3MoeForCausalLM,; Qwen3MoeForCausalLMPipe,
     AutoConfig,
     AutoModelForCausalLM,
     AutoModelForCausalLMPipe,
     AutoTokenizer,
-    DeepseekV2ForCausalLM,
-    DeepseekV2ForCausalLMPipe,
-    DeepseekV3ForCausalLM,
-    DeepseekV3ForCausalLMPipe,
-    Ernie4_5_MoeForCausalLM,
-    Ernie4_5_MoeForCausalLMPipe,
-    Ernie4_5ForCausalLM,
-    Ernie4_5ForCausalLMPipe,
     Llama3Tokenizer,
-    LlamaForCausalLM,
-    LlamaForCausalLMPipe,
     LlamaTokenizer,
-    Qwen2ForCausalLM,
-    Qwen2ForCausalLMPipe,
-    Qwen2MoeForCausalLM,
-    Qwen2MoeForCausalLMPipe,
-    Qwen3ForCausalLM,
-    Qwen3ForCausalLMPipe,
-    Qwen3MoeForCausalLM,
-    Qwen3MoeForCausalLMPipe,
 )
 from paddleformers.transformers.configuration_utils import LlmMetaConfig
 from paddleformers.trl import DataConfig, ModelConfig, SFTConfig, SFTTrainer
@@ -65,27 +47,6 @@ from paddleformers.utils.log import logger
 
 # Fine-tune Environment Variables to support sharding stage1 overlap optimization.
 os.environ["USE_CASUAL_MASK"] = "False"
-
-flash_mask_support_list = [
-    DeepseekV2ForCausalLM,
-    DeepseekV2ForCausalLMPipe,
-    DeepseekV3ForCausalLM,
-    DeepseekV3ForCausalLMPipe,
-    Ernie4_5ForCausalLM,
-    Ernie4_5ForCausalLMPipe,
-    Ernie4_5_MoeForCausalLM,
-    Ernie4_5_MoeForCausalLMPipe,
-    LlamaForCausalLM,
-    LlamaForCausalLMPipe,
-    Qwen2ForCausalLM,
-    Qwen2ForCausalLMPipe,
-    Qwen2MoeForCausalLM,
-    Qwen2MoeForCausalLMPipe,
-    Qwen3ForCausalLM,
-    Qwen3ForCausalLMPipe,
-    Qwen3MoeForCausalLM,
-    Qwen3MoeForCausalLMPipe,
-]
 
 
 def main():
@@ -173,6 +134,12 @@ def main():
     model_config.max_sequence_length = training_args.max_seq_len
     model_config.num_nextn_predict_layers = model_args.num_nextn_predict_layers
     model_config._attn_implementation = model_args.attn_impl
+    if training_args.use_expert_parallel and training_args.expert_parallel_degree >= 1:
+        model_config.n_group = training_args.expert_parallel_degree
+    model_config.use_fused_head_and_loss_fn = model_args.use_fused_head_and_loss_fn
+    model_config.use_filtered_label_loss = training_args.use_filtered_label_loss
+    model_config.loss_subbatch_sequence_length = training_args.loss_subbatch_sequence_length
+    # model_config.num_hidden_layers = 12
     logger.info(f"Final model config: {model_config}")
     logger.info("Creating model")
 
