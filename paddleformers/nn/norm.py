@@ -19,6 +19,9 @@ from ..generation.configuration_utils import PretrainedConfig
 from ..utils.log import logger
 from .general import GeneralInterface
 
+# from paddle.incubate.nn.functional import fused_rms_norm_ext
+
+
 try:
     from paddle.distributed.fleet.utils.sequence_parallel_utils import (
         mark_as_sequence_parallel_parameter,
@@ -59,6 +62,9 @@ class RMSNorm(nn.Layer):
         self.config = config
 
     def forward(self, hidden_states):
+        # if self.config.get("fuse_rms_norm", False):
+        #     return fused_rms_norm_ext(hidden_states, self.weight, self.variance_epsilon)[0].astype(self.weight.dtype)
+
         if paddle.in_dynamic_mode():
             with paddle.amp.auto_cast(False):
                 variance = hidden_states.astype("float32").pow(2).mean(-1, keepdim=True)

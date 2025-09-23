@@ -140,6 +140,8 @@ def main():
     model_config.use_filtered_label_loss = training_args.use_filtered_label_loss
     model_config.loss_subbatch_sequence_length = training_args.loss_subbatch_sequence_length
     # model_config.num_hidden_layers = 12
+    # model_config.moe_subbatch_token_num = model_args.moe_subbatch_token_num
+    model_config.moe_subbatch_token_num = 4096
     logger.info(f"Final model config: {model_config}")
     logger.info("Creating model")
 

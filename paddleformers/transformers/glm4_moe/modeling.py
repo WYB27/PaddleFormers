@@ -220,20 +220,20 @@ class Glm4MoeAttention(nn.Layer):
             value_states = self.v_proj(hidden_states)
 
             if self.sequence_parallel:
-                target_query_shape = [batch_size, -1, self.num_heads, self.head_dim]
-                target_key_value_shape = [batch_size, -1, self.num_key_value_heads, self.head_dim]
+                max_sequence_length = self.config.max_sequence_length
+                bsz = hidden_states.shape[0] * self.config.tensor_parallel_degree // max_sequence_length
+                q_len = max_sequence_length
             else:
-                target_query_shape = [0, 0, self.num_heads, self.head_dim]
-                target_key_value_shape = [0, 0, self.num_key_value_heads, self.head_dim]
-            query_states = query_states.reshape(target_query_shape)
-            key_states = key_states.reshape(target_key_value_shape)
-            value_states = value_states.reshape(target_key_value_shape)
+                bsz, q_len, _ = hidden_states.shape
+            query_states = query_states.reshape([bsz, q_len, -1, self.head_dim])
+            key_states = key_states.reshape([bsz, q_len, -1, self.head_dim])
+            value_states = value_states.reshape([bsz, q_len, -1, self.head_dim])
         else:
             mix_layer = self.qkv_proj(hidden_states)
             if self.sequence_parallel:
                 target_shape = [
-                    batch_size,
-                    -1,
+                    bsz,
+                    q_len,
                     self.num_key_value_heads,
                     (self.num_key_value_groups + 2) * self.head_dim,
                 ]
@@ -303,20 +303,21 @@ class Glm4MoeTopkFlexRouter(PretrainedMoEGate):
         )
         self.expert_usage.stop_gradient = True
 
+        # weight and e_score_correction_bias do not need to be cast to low precision
+        self._cast_to_low_precision = False
+
     def forward(self, hidden_states):
         """
         Args:
             hidden_states (_type_): [batch_size * seq_len, hidden_size]
         """
 
-        _, _, h_dim = hidden_states.shape
+        # _, _, h_dim = hidden_states.shape
 
         # compute gating score
         with paddle.amp.auto_cast(False):
             hidden_states = hidden_states.cast(self.weight.dtype)
-
             logits = F.linear(hidden_states.cast("float32"), self.weight.cast("float32").t())
-
             scores = self.gate_score_func(logits=logits)
             scores = scores.cast(paddle.float32)
 
@@ -339,11 +340,14 @@ class Glm4MoeTopkRouter(nn.Layer):
 
         self.weight = paddle.create_parameter(
             shape=[self.n_routed_experts, config.hidden_size],
-            dtype="bfloat16",
+            dtype="float32",
             default_initializer=paddle.nn.initializer.Uniform(),
         )
 
         self.register_buffer("e_score_correction_bias", paddle.zeros((self.n_routed_experts,), dtype=paddle.float32))
+
+        # weight and e_score_correction_bias do not need to be cast to low precision
+        self._cast_to_low_precision = False
 
     @paddle.no_grad()
     def get_topk_indices(self, scores):
@@ -489,8 +493,18 @@ class Glm4MoeFlexMoE(MoEFlexTokenLayer):
             moe_group=moe_group,
         )
         if hasattr(dist, "fleet") and dist.is_initialized() and expert_parallel_degree > 1:
+            # for p in self.experts.parameters():
+            #     setattr(p, "color", {"color": "moe_expert", "group": moe_grad_group})
+            self.is_mp_moe = False
+            self.is_ep_moe = True
             for p in self.experts.parameters():
+                setattr(p, "is_moe_param", True)
                 setattr(p, "color", {"color": "moe_expert", "group": moe_grad_group})
+                p.no_sync = not self.is_mp_moe
+                p.expert = not self.is_mp_moe
+                logger.info(f"expert no-sync={p.no_sync}-{p.name}")
+                if self.is_mp_moe or self.is_ep_moe:
+                    p.is_distributed = True
 
         self.shared_experts = Glm4MoeMLP(
             config=config,
@@ -540,6 +554,167 @@ class Glm4MoeDecoderLayer(nn.Layer):
             if not hasattr(config, "disable_ffn_model_parallel"):
                 self.input_layernorm.enable_sequence_parallel()
 
+    def subbatch_recompute_forward(
+        self,
+        hidden_states: paddle.Tensor,
+        batch_size: int,
+        hidden_size: int,
+        position_ids: Optional[paddle.Tensor] = None,
+        attention_mask: Optional[paddle.Tensor] = None,
+        output_attentions: Optional[bool] = False,
+        past_key_value: Optional[Tuple[paddle.Tensor]] = None,
+        use_cache: Optional[bool] = False,
+        attn_mask_startend_row_indices: Optional[paddle.Tensor] = None,
+        position_embeddings: Optional[Tuple[paddle.Tensor, paddle.Tensor]] = None,
+    ) -> paddle.Tensor:
+        offload_kwargs = {}
+        offload_kwargs["offload_indices"] = [0]
+        assert self.config.recompute_granularity != "full_attn"
+        attn_outputs = recompute(
+            self.attn,
+            hidden_states,
+            past_key_value=past_key_value,
+            attention_mask=attention_mask,
+            attn_mask_startend_row_indices=attn_mask_startend_row_indices,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            position_embeddings=position_embeddings,
+            **offload_kwargs,
+        )
+
+        hidden_states = attn_outputs[0]
+        residual = attn_outputs[1]
+        self_attn_weights = attn_outputs[2] if output_attentions else None
+        present_key_value = attn_outputs[3] if use_cache else None
+
+        if len(hidden_states.shape) != 3:
+            if self.config.sequence_parallel:
+                hidden_states = hidden_states.reshape([-1, batch_size, hidden_size])
+            else:
+                hidden_states = hidden_states.reshape([batch_size, -1, hidden_size])
+        sub_seq_len = self.config.moe_subbatch_token_num
+        seq_axis = 0 if self.config.sequence_parallel else 1
+        seq_len = hidden_states.shape[seq_axis]
+        # seq_len = sequence_length
+        assert seq_len % sub_seq_len == 0
+        num_chunks = seq_len // sub_seq_len
+        split_list = [sub_seq_len] * num_chunks
+        input_list = paddle.split(hidden_states, split_list, axis=seq_axis)
+        output_list = []
+
+        for chunk in input_list:
+            chunk = chunk.reshape([-1, hidden_size])
+            out = recompute(
+                self.mlp.forward,
+                chunk,
+                **offload_kwargs,
+            )
+            output_list.append(out)
+        hidden_states = paddle.concat(output_list, axis=seq_axis)
+        outputs = recompute(
+            self.post_process,
+            hidden_states,
+            residual,
+            output_attentions,
+            use_cache,
+            self_attn_weights,
+            present_key_value,
+            **offload_kwargs,
+        )
+        return outputs
+
+    def attn(
+        self,
+        hidden_states: paddle.Tensor,
+        position_ids: Optional[paddle.Tensor] = None,
+        attention_mask: Optional[paddle.Tensor] = None,
+        output_attentions: Optional[bool] = False,
+        past_key_value: Optional[Tuple[paddle.Tensor]] = None,
+        use_cache: Optional[bool] = False,
+        attn_mask_startend_row_indices: Optional[paddle.Tensor] = None,
+        position_embeddings: Optional[Tuple[paddle.Tensor, paddle.Tensor]] = None,
+        **kwargs,
+    ) -> paddle.Tensor:
+        # print(f"layer_idx: {self.layer_idx}\nmemory_allocated: {paddle.device.cuda.memory_allocated() / (1024**3)}\nmemory_reserved: {paddle.device.cuda.memory_reserved() / (1024**3)}")
+        # print("hidden_states: ", hidden_states)
+        residual = hidden_states
+
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        has_gradient = not hidden_states.stop_gradient
+        if self.config.recompute and has_gradient and self.config.recompute_granularity == "full_attn":
+            outputs = recompute(
+                self.self_attn,
+                hidden_states=hidden_states,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attn_mask_startend_row_indices=attn_mask_startend_row_indices,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+        else:
+            outputs = self.self_attn(
+                hidden_states=hidden_states,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attn_mask_startend_row_indices=attn_mask_startend_row_indices,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+        if type(outputs) is tuple:
+            hidden_states = outputs[0]
+        else:
+            hidden_states = outputs
+
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        attn_outputs = (hidden_states, residual)
+
+        if output_attentions:
+            self_attn_weights = outputs[1]
+            attn_outputs += (self_attn_weights,)
+
+        if use_cache:
+            present_key_value = outputs[2 if output_attentions else 1]
+            attn_outputs += (present_key_value,)
+
+        return attn_outputs
+
+    def post_process(
+        self,
+        hidden_states,
+        residual,
+        output_attentions=False,
+        use_cache=False,
+        self_attn_weights=None,
+        present_key_value=None,
+    ):
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (self_attn_weights,)
+
+        if use_cache:
+            outputs += (present_key_value,)
+
+        if type(outputs) is tuple and len(outputs) == 1:
+            outputs = outputs[0]
+
+        return outputs
+
     def forward(
         self,
         hidden_states: paddle.Tensor,
@@ -552,13 +727,9 @@ class Glm4MoeDecoderLayer(nn.Layer):
         attn_mask_startend_row_indices: Optional[paddle.Tensor] = None,
         **kwargs,
     ) -> paddle.Tensor:
-        # print(f"layer_idx: {self.layer_idx}\nmemory_allocated: {paddle.device.cuda.memory_allocated() / (1024**3)}\nmemory_reserved: {paddle.device.cuda.memory_reserved() / (1024**3)}")
-        # print("hidden_states: ", hidden_states)
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
+
+        attn_outputs = self.attn(
+            hidden_states,
             past_key_value=past_key_value,
             attention_mask=attention_mask,
             attn_mask_startend_row_indices=attn_mask_startend_row_indices,
@@ -566,25 +737,17 @@ class Glm4MoeDecoderLayer(nn.Layer):
             output_attentions=output_attentions,
             use_cache=use_cache,
             position_embeddings=position_embeddings,
+            **kwargs,
         )
-        hidden_states = residual + hidden_states
+        hidden_states = attn_outputs[0]
+        residual = attn_outputs[1]
+        self_attn_weights = attn_outputs[2] if output_attentions else None
+        present_key_value = attn_outputs[3] if use_cache else None
 
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        if isinstance(hidden_states, tuple):
-            hidden_states, _ = hidden_states
-        # else:
-        #     router_logits = None
-        hidden_states = residual + hidden_states
-        outputs = (hidden_states,)
-        if output_attentions:
-            outputs += (self_attn_weights,)
-        if use_cache:
-            outputs += (present_key_value,)
-        if type(outputs) is tuple and len(outputs) == 1:
-            outputs = outputs[0]
+        outputs = self.post_process(
+            hidden_states, residual, output_attentions, use_cache, self_attn_weights, present_key_value
+        )
         return outputs
 
 
@@ -592,6 +755,7 @@ class Glm4MoePreTrainedModel(PretrainedModel):
     config: Glm4MoeConfig
     config_class = Glm4MoeConfig
     base_model_prefix = "model"
+    _keep_in_fp32_modules = ["mlp.gate.weight", "e_score_correction_bias"]
     transpose_weight_keys = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
     @classmethod
@@ -1029,13 +1193,30 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
+        moelayer_use_subbatch_recompute = (
+            self.config.moe_subbatch_token_num > 0 if hasattr(self.config, "moe_subbatch_token_num") else False
+        )
+
         for idx, (decoder_layer) in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
             has_gradient = not hidden_states.stop_gradient
-            if self.config.recompute and self.config.recompute_granularity == "full" and has_gradient:
+            if moelayer_use_subbatch_recompute:
+                layer_outputs = decoder_layer.subbatch_recompute_forward(
+                    hidden_states,
+                    bs,
+                    hidden_size,
+                    position_ids,
+                    causal_mask,
+                    output_attentions,
+                    past_key_value,
+                    use_cache,
+                    attn_mask_startend_row_indices,
+                    position_embeddings,
+                )
+            elif self.config.recompute and self.config.recompute_granularity == "full" and has_gradient:
                 layer_outputs = self.recompute_training_full(
                     layer_module=decoder_layer,
                     hidden_states=hidden_states,
@@ -1058,7 +1239,6 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
                     use_cache=use_cache,
                     position_embeddings=position_embeddings,
                 )
-
             # # NOTE: clear outdate cache after it has been used for memory saving
             # past_key_value = past_key_values[idx] = None
             if isinstance(layer_outputs, (tuple, list)):
