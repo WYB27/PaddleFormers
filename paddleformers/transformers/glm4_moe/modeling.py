@@ -34,7 +34,6 @@ from ...nn.mlp import MLP as Glm4MoeMLP
 from ...nn.norm import Norm as GeneralNorm
 from ...nn.pp_model import GeneralModelForCausalLMPipe
 from ...utils.log import logger
-from ..llama.modeling import get_use_casual_mask
 from ..model_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ..model_utils import PretrainedModel, register_base_model
 from ..moe_gate import PretrainedMoEGate
@@ -432,6 +431,8 @@ class Glm4MoeMoE(nn.Layer):
         return final_hidden_states.cast(hidden_states.dtype)
 
     def forward(self, hidden_states):
+        # print(f"moe layer\nmemory_allocated: {paddle.device.cuda.memory_allocated() / (1024**3)}\nmemory_reserved: {paddle.device.cuda.memory_reserved() / (1024**3)}")
+        # print("hidden_states: ", hidden_states)
         residuals = hidden_states
         orig_shape = hidden_states.shape
         topk_indices, topk_weights = self.gate(hidden_states)
@@ -508,6 +509,7 @@ class Glm4MoeDecoderLayer(nn.Layer):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
 
         self.self_attn = Glm4MoeAttention(config=config, layer_idx=layer_idx)
 
@@ -550,6 +552,8 @@ class Glm4MoeDecoderLayer(nn.Layer):
         attn_mask_startend_row_indices: Optional[paddle.Tensor] = None,
         **kwargs,
     ) -> paddle.Tensor:
+        # print(f"layer_idx: {self.layer_idx}\nmemory_allocated: {paddle.device.cuda.memory_allocated() / (1024**3)}\nmemory_reserved: {paddle.device.cuda.memory_reserved() / (1024**3)}")
+        # print("hidden_states: ", hidden_states)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
@@ -1006,27 +1010,18 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
             # [seq_len * bs / n, num_head * head_dim] (n is mp parallelism)
             inputs_embeds = ScatterOp.apply(inputs_embeds)
 
-        if attn_mask_startend_row_indices is not None or get_use_casual_mask():
-            attention_mask = None
-        else:
-            # [bs, seq_len]
-            attention_mask = (
-                paddle.ones((batch_size, seq_length_with_past), dtype=paddle.bool)
-                if attention_mask is None
-                else attention_mask
-            )
+        hidden_states = inputs_embeds
 
+        if attention_mask is not None:
             causal_mask = self._prepare_decoder_attention_mask(
-                attention_mask=attention_mask,
-                input_shape=(batch_size, seq_length),
-                past_key_values_length=cache_length,
-                dtype=inputs_embeds.dtype,
-            )  # [bs, 1, seq_len, seq_len]
+                attention_mask, hidden_states.shape[:2], cache_length, hidden_states.dtype
+            )
+        else:
+            causal_mask = None
 
         if position_ids is None:
             position_ids = paddle.arange(seq_length, dtype="int64").expand((batch_size, seq_length))
 
-        hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
@@ -1198,6 +1193,7 @@ class Glm4MoeForCausalLM(Glm4MoePreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            attn_mask_startend_row_indices=attn_mask_startend_row_indices,
         )
 
         hidden_states = outputs[0]  # [bs, seq_len, dim]

@@ -1149,6 +1149,8 @@ class Trainer:
 
             step = -1
             for step, inputs in enumerate(epoch_iterator):
+                # print(f"step: {step}\nmemory_allocated: {paddle.device.cuda.memory_allocated() / (1024**3)}\nmemory_reserved: {paddle.device.cuda.memory_reserved() / (1024**3)}")
+                # print("inputs: ", inputs)
                 if (
                     self.args.use_hybrid_parallel
                     and self.args.sep_parallel_degree > 1
@@ -1353,6 +1355,8 @@ class Trainer:
 
                     if self.args.offload_optim:
                         self._reload_optimizer()
+
+                    paddle.device.cuda.empty_cache()
 
                     if self.do_grad_scaling:
                         if args.pipeline_parallel_degree > 1:
