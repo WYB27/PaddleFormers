@@ -292,7 +292,7 @@ class Glm4MoeTopkFlexRouter(PretrainedMoEGate):
 
         self.weight = paddle.create_parameter(
             shape=[num_experts, expert_hidden_size],
-            dtype="bfloat16",
+            dtype="float32",
             default_initializer=paddle.nn.initializer.Uniform(),
         )
 
@@ -513,7 +513,7 @@ class Glm4MoeFlexMoE(MoEFlexTokenLayer):
         )
 
     def forward(self, hidden_states):
-        final_hidden_states, _, _ = super().forward(hidden_states)
+        final_hidden_states, aux_loss, _ = super().forward(hidden_states)
         final_hidden_states = final_hidden_states + self.shared_experts(hidden_states)
         return final_hidden_states
 
@@ -601,17 +601,20 @@ class Glm4MoeDecoderLayer(nn.Layer):
         num_chunks = seq_len // sub_seq_len
         split_list = [sub_seq_len] * num_chunks
         input_list = paddle.split(hidden_states, split_list, axis=seq_axis)
-        output_list = []
+        hidden_states_output_list = []
+        aux_loss_output_list = []
 
         for chunk in input_list:
             chunk = chunk.reshape([-1, hidden_size])
-            out = recompute(
+            hidden_states_out, aux_loss_out = recompute(
                 self.mlp.forward,
                 chunk,
                 **offload_kwargs,
             )
-            output_list.append(out)
-        hidden_states = paddle.concat(output_list, axis=seq_axis)
+            hidden_states_output_list.append(hidden_states_out)
+            aux_loss_output_list.append(aux_loss_out)
+        hidden_states = paddle.concat(hidden_states_output_list, axis=seq_axis)
+        aux_loss = paddle.concat(aux_loss_output_list).sum()
         outputs = recompute(
             self.post_process,
             hidden_states,
@@ -622,7 +625,7 @@ class Glm4MoeDecoderLayer(nn.Layer):
             present_key_value,
             **offload_kwargs,
         )
-        return outputs
+        return outputs, aux_loss
 
     def attn(
         self,
@@ -1192,6 +1195,7 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
+        aux_loss = 0
 
         moelayer_use_subbatch_recompute = (
             self.config.moe_subbatch_token_num > 0 if hasattr(self.config, "moe_subbatch_token_num") else False
@@ -1245,6 +1249,8 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
                 hidden_states = layer_outputs[0]
             else:
                 hidden_states = layer_outputs
+                if moelayer_use_subbatch_recompute:
+                    aux_loss += layer_outputs[1]
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -1260,7 +1266,7 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
 
         next_cache = next_decoder_cache if use_cache else None
         if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache] if v is not None)
+            return tuple(v for v in [hidden_states, next_cache, aux_loss] if v is not None)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
@@ -1375,13 +1381,16 @@ class Glm4MoeForCausalLM(Glm4MoePreTrainedModel):
             return_dict=return_dict,
             attn_mask_startend_row_indices=attn_mask_startend_row_indices,
         )
-
+        # output: hidden_states, next_cache, aux_loss
         hidden_states = outputs[0]  # [bs, seq_len, dim]
         logits = self.lm_head(hidden_states)
 
         loss = None
         if labels is not None:
             loss, _ = self.criterion(logits, labels)
+            if self.config.moe_aux_loss_coeff:
+                aux_loss = outputs[2]
+                loss += self.moe_aux_loss_coeff * aux_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -1389,6 +1398,7 @@ class Glm4MoeForCausalLM(Glm4MoePreTrainedModel):
 
         return CausalLMOutputWithPast(
             loss=loss,
+            aux_loss=aux_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
